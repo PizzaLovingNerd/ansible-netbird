@@ -5,14 +5,16 @@ names, fixed internal Traefik IPs, and generated secret values unless changing t
 
 ## Scope
 
-`getting_started.yml` is an Ansible implementation of the NetBird self-hosted getting-started flow. It deploys the current combined NetBird server layout:
-- `netbird-dashboard`
-- `netbird-server`
-- optional built-in Traefik
-- optional NetBird reverse proxy and CrowdSec, only with built-in Traefik
-- Some configuration options for automated deployment with other reverse proxies.
+`getting_started.yml` is a thin wrapper around the `community.ansible_netbird.server` role, an Ansible implementation of [`getting-started.sh`](https://github.com/netbirdio/netbird/blob/main/infrastructure_files/getting-started.sh) from the NetBird repository. Each prompt in the script is a role variable, and the generated files match what the script writes. It deploys the current combined NetBird server layout:
 
-The playbook can also generate or install reverse-proxy configuration for a few external proxy modes. Some external modes are deliberately manual because they represent operator-owned infrastructure.
+- `netbird-dashboard`
+- `netbird-server` (management, signal, relay and STUN in one container)
+- optional built-in Traefik
+- optional NetBird Proxy and CrowdSec, only with built-in Traefik
+- the agent-network preset (`netbird_agent_network`)
+- configuration for external Traefik, nginx, Nginx Proxy Manager, Caddy or your own proxy, with optional automation for some of them
+
+Unlike the script, the role can be re-run against a deployment it created (see `allow_existing_config`).
 
 ## Target Host Requirements
 
@@ -21,9 +23,9 @@ The target host must have:
 - Linux with a public IPv4 address
 - Docker Engine installed and running
 - Docker Compose available as `docker compose` or `docker-compose`
-- `jq`
 - `openssl`
-- an Ansible SSH user that can run `docker info`
+- an Ansible SSH user that can run `docker info` (or `create_netbird_user=true`
+  and become privileges)
 
 \
 For public TLS deployments, DNS for `netbird_domain` must point to the target host before the playbook performs public endpoint checks or before external proxies request certificates.
@@ -34,8 +36,10 @@ Required public firewall ports depend on mode, but most deployments need:
 - `443/tcp` for HTTPS
 - `3478/udp` for NetBird STUN
 
-The playbook does not install Docker, `jq`, or `openssl`. Missing prerequisites
-fail early with explicit messages.
+The playbook does not install Docker or `openssl`. Missing prerequisites fail
+early with explicit messages. Unlike the script, it does not need `jq`. If the
+domain does not resolve from the target host, the playbook warns and carries on,
+like the script does in non-interactive mode.
 
 ## Inventory
 
@@ -47,7 +51,7 @@ Example inventory:
 
 Run with:
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=builtin_traefik \
   -e traefik_acme_email=admin@example.org
@@ -65,10 +69,11 @@ netbird_domain: netbird.example.org
 
 Rules:
 
-- Use a real FQDN for TLS deployments.
-- Do not include `http://` or `https://`.
+- Use a fully qualified domain name with at least one dot.
+- Do not include a scheme, port or trailing dot.
 - Do not use the placeholder `netbird.example.com`.
-- Use `use-ip` only for a non-TLS IP-based test deployment.
+- Do not use an IP address. Use `use-ip` instead for a non-TLS IP-based test
+  deployment; it only works with `reverse_proxy_type=manual`.
 
 Example IP-only test:
 
@@ -91,14 +96,14 @@ Controls how public HTTPS traffic reaches NetBird.
 reverse_proxy_type: builtin_traefik
 ```
 
-Allowed values:
+Allowed values, with the matching `getting-started.sh` option:
 
-- `builtin_traefik`
-- `external_traefik`
-- `nginx`
-- `npm`
-- `caddy`
-- `manual`
+- `builtin_traefik` (0, the default)
+- `external_traefik` (1)
+- `nginx` (2)
+- `npm` (3)
+- `caddy` (4)
+- `manual` (5)
 
 ## Common Variables
 
@@ -107,18 +112,13 @@ Allowed values:
 Where generated NetBird files are written.
 
 ```yaml
-netbird_project_dir: "{{ ansible_user_dir }}/netbird"
+netbird_project_dir: ""
 ```
 
-Default for root-based VPS testing is usually `/root/netbird`.
-
-Generated files include:
-
-- `docker-compose.yml`
-- `dashboard.env`
-- `config.yaml`
-- reverse-proxy snippets for selected modes
-- generated secret files
+Empty means `netbird` in the home directory of the user that runs Docker
+Compose: the SSH user, or `netbird_user` with `create_netbird_user=true`. For a
+root SSH user that is `/root/netbird`. The directory name is also the Docker
+Compose project name.
 
 ### `start_netbird_services`
 
@@ -132,22 +132,54 @@ Set to `false` if you only want generated files.
 
 ### `allow_existing_config`
 
-Controls whether the playbook may operate on an existing generated NetBird
-deployment directory.
+Controls whether the playbook may run against a directory that already contains
+`config.yaml`.
 
 ```yaml
 allow_existing_config: false
 ```
 
-This variable is intentionally not declared in the default `vars` block. When it
-is absent or `false`, the playbook refuses to reinitialize a directory that
-already contains `config.yaml`.
-
-Set it only for an intentional in-place rerun:
+When `false`, the playbook refuses to touch an existing deployment, like the
+script. Set it to `true` to converge an existing deployment in place:
 
 ```bash
 ansible-playbook ... -e allow_existing_config=true
 ```
+
+On a re-run the playbook reads the relay secret, datastore encryption key and
+session cookie encryption key back from `config.yaml` and only generates the ones
+that are missing, so it also works on deployments made by `getting-started.sh`
+or by older versions of this playbook (which did not set a session cookie key).
+It re-renders the generated files, restarts `netbird-server` when `config.yaml`
+changed, reuses the NetBird Proxy token and CrowdSec bouncer key already in
+`proxy.env`, and removes containers for services you turned off (for example the
+proxy after `builtin_traefik_enable_proxy=false`). Compose files this role wrote
+for an external Traefik or Nginx Proxy Manager runtime are updated in place;
+the overwrite flags are only needed for files you wrote yourself.
+
+### `wait_for_reverse_proxy`
+
+For `nginx`, `caddy` and `manual` without an install option, the script prints
+the proxy instructions and waits for Enter before starting the containers. The
+playbook does the same with a pause.
+
+```yaml
+wait_for_reverse_proxy: true
+```
+
+Set it to `false` for unattended runs. Ansible also skips the pause when it has
+no terminal.
+
+### `netbird_validate_certs`
+
+Whether the public endpoint health check validates the TLS certificate.
+
+```yaml
+netbird_validate_certs: true
+```
+
+Turn it off only for tests against a private ACME CA such as Let's Encrypt
+staging or Pebble.
 
 ### `bind_localhost_only`
 
@@ -220,23 +252,24 @@ external network. The generated snippets then target container names such as
 
 If unset, generated snippets target host ports such as `127.0.0.1:8081`.
 
-## Existing Config Protection
+## Forwarded Client IPs
 
-The playbook refuses to overwrite an existing generated NetBird config by
-default:
+NetBird reads the client address from `X-Forwarded-For` only when the connection
+comes from a trusted peer. The playbook writes the same `server.reverseProxy`
+block as the script.
 
-```text
-/root/netbird/config.yaml already exists. This playbook will not reinitialize secrets by default.
+```yaml
+trusted_peers: []
+trusted_http_proxies: []
 ```
 
-To intentionally manage an existing deployment in place:
-
-```bash
-ansible-playbook ... -e allow_existing_config=true
-```
-
-Use this carefully. It preserves existing secret files when present, but it can
-rewrite generated Compose and proxy configuration.
+- With built-in Traefik both default to Traefik's own address
+  (`172.30.0.10/32`).
+- For every other mode, set `trusted_peers` to the address your proxy connects
+  to NetBird from, for example `['172.20.0.5/32']` for a proxy container, or the
+  Docker bridge gateway when a host proxy reaches the exposed ports. When it is
+  empty NetBird trusts forwarded headers from every source, so clients can spoof
+  their IP. The playbook warns about this, like the script does.
 
 ## Built-In Traefik Mode
 
@@ -267,20 +300,27 @@ traefik_acme_email: admin@example.org
 
 #### `builtin_traefik_enable_proxy`
 
-Enables the NetBird reverse proxy service.
+Enables the NetBird Proxy service, which exposes internal NetBird resources to
+the internet. Off by default, like the script.
 
 ```yaml
-builtin_traefik_enable_proxy: true
+builtin_traefik_enable_proxy: false
 ```
+
+The proxy needs an access token from the running server, so the playbook starts
+the other services first, creates the token with
+`netbird-server admin token create`, writes `proxy.env` and then starts the
+proxy. Point a wildcard DNS record such as `*.netbird.example.org` at the host
+and open `51820/udp` if you want P2P connections to the proxy.
 
 This option applies only to `builtin_traefik`.
 
 #### `builtin_traefik_enable_crowdsec`
 
-Enables CrowdSec alongside the NetBird reverse proxy.
+Enables CrowdSec IP reputation blocking for the NetBird Proxy. Off by default.
 
 ```yaml
-builtin_traefik_enable_crowdsec: true
+builtin_traefik_enable_crowdsec: false
 ```
 
 This option applies only to `builtin_traefik`.
@@ -290,26 +330,69 @@ Validation rule:
 - `builtin_traefik_enable_crowdsec=true` requires
   `builtin_traefik_enable_proxy=true`.
 
-### Built-In Traefik Examples
+#### `netbird_proxy_require_subdomain`
 
-Default recommended path:
+Restricts the NetBird Proxy to subdomains of `netbird_domain`
+(`NB_PROXY_REQUIRE_SUBDOMAIN=true` and a matching Traefik SNI rule). Off by
+default like the script, which passes every unmatched TLS connection to the
+proxy so services can also use custom domains.
+
+```yaml
+netbird_proxy_require_subdomain: false
+```
+
+#### `traefik_acme_ca_server`
+
+ACME directory for Traefik and the NetBird Proxy. Empty means Let's Encrypt
+production.
+
+```yaml
+traefik_acme_ca_server: https://acme-staging-v02.api.letsencrypt.org/directory
+```
+
+#### `traefik_image`
+
+Defaults to the version the script pins (`traefik:v3.7.14`). It must be a
+numeric tag of v3.7.13 or newer without a digest, because the generated
+configuration uses `aliasHeadersStrategy`; the playbook checks this like the
+script does. The same applies to a Traefik runtime installed with
+`external_traefik_install_config=true`.
+
+### Agent-Network Preset
+
+`netbird_agent_network=true` matches `NETBIRD_AGENT_NETWORK=true` in the script.
+It forces built-in Traefik with the NetBird Proxy in private mode
+(`NB_PROXY_PRIVATE=true`), sets the dashboard to agent-network-only mode
+(`NETBIRD_AGENT_NETWORK_ONLY=true`) and leaves CrowdSec off. Only
+`netbird_domain` and `traefik_acme_email` are needed.
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
+  -e netbird_domain=netbird.example.org \
+  -e traefik_acme_email=admin@example.org \
+  -e netbird_agent_network=true
+```
+
+### Built-In Traefik Examples
+
+Default path:
+
+```bash
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=builtin_traefik \
   -e traefik_acme_email=admin@example.org
 ```
 
-Disable NetBird proxy and CrowdSec:
+With the NetBird Proxy and CrowdSec:
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=builtin_traefik \
   -e traefik_acme_email=admin@example.org \
-  -e builtin_traefik_enable_proxy=false \
-  -e builtin_traefik_enable_crowdsec=false
+  -e builtin_traefik_enable_proxy=true \
+  -e builtin_traefik_enable_crowdsec=true
 ```
 
 ## External Traefik Mode
@@ -339,11 +422,8 @@ Docker network Traefik uses for service discovery.
 traefik_external_network: traefik
 ```
 
-Required when `external_traefik_install_config=true`.
-
-If omitted and `external_traefik_install_config=false`, NetBird uses its own
-`netbird` network, which usually is not what an existing external Traefik
-container needs.
+Required for `external_traefik`. NetBird's containers join this network so
+Traefik can reach them.
 
 ### `traefik_entrypoint`
 
@@ -385,21 +465,13 @@ When enabled, the playbook:
 - attaches NetBird containers to the Traefik network
 - validates the public endpoint through Traefik
 
-#### `external_traefik_trusted_proxy_cidr`
-
-Optional CIDR to add to NetBird's trusted HTTP proxy list.
-
-```yaml
-external_traefik_trusted_proxy_cidr: ""
-```
-
-Leave blank unless you know the Traefik source network CIDR that NetBird should
-trust for forwarded headers.
+Set `trusted_peers` to Traefik's address on that network so NetBird trusts its
+forwarded headers (see Forwarded Client IPs).
 
 ### External Traefik Example
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=external_traefik \
   -e traefik_external_network=traefik \
@@ -443,10 +515,13 @@ nginx_reload: true
 When enabled, the playbook:
 
 - installs the generated config to `nginx_config_path`
-- symlinks it to `nginx_enabled_config_path`
+- symlinks it to `nginx_enabled_config_path` (set it to `""` on distributions
+  without `sites-enabled`, such as RHEL with `nginx_config_path:
+  /etc/nginx/conf.d/netbird.conf`)
 - optionally removes `/etc/nginx/sites-enabled/default`
 - runs `nginx -t`
-- reloads Nginx when `nginx_reload=true`
+- reloads Nginx when `nginx_reload=true` and something changed
+- checks the public endpoint once NetBird is up
 
 ### Certificate Handling
 
@@ -593,12 +668,11 @@ caddy_acme_ca: ""
 
 When enabled, the playbook:
 
-- installs the generated Caddyfile to `caddy_config_path`
-- runs `caddy fmt --overwrite`
-- runs `caddy validate`
-- reloads Caddy
+- writes the generated Caddyfile to `caddy_config_path`, validating it with
+  `caddy validate` first. This replaces the whole file, so point
+  `caddy_config_path` at an imported file if your Caddyfile serves other sites.
+- reloads Caddy when the file changed
 - starts NetBird
-- reloads Caddy again after NetBird starts
 - performs a public endpoint health check
 
 ### Caddy ACME Options
@@ -662,10 +736,11 @@ netbird_user: netbird
 
 When `create_netbird_user=true`, the playbook:
 
-- creates `netbird_user`
-- adds it to the `docker` group
-- verifies group membership
+- creates `netbird_user` and adds it to the `docker` group
 - verifies that user can run Docker
+- puts the project directory in that user's home unless `netbird_project_dir`
+  is set, and makes the user own the generated files
+- runs every Docker and Docker Compose command as that user
 
 This requires become/root privileges and a Docker socket owned by the standard
 `docker` group.
@@ -673,7 +748,7 @@ This requires become/root privileges and a Docker socket owned by the standard
 Example:
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=builtin_traefik \
   -e traefik_acme_email=admin@example.org \
@@ -689,14 +764,13 @@ Common files:
 
 - `docker-compose.yml`
 - `dashboard.env`
-- `config.yaml`
-- `relay_auth_secret`
-- `datastore_encryption_key`
+- `config.yaml` (mode `0600`, holds the generated secrets)
 
 Mode-specific files:
 
-- `traefik-dynamic.yaml` for built-in Traefik NetBird proxy
-- `proxy.env` for NetBird reverse proxy
+- `traefik-dynamic.yaml` for the NetBird Proxy behind built-in Traefik
+- `proxy.env` for the NetBird Proxy (mode `0600`, holds its token)
+- `crowdsec/` for CrowdSec
 - `nginx-netbird.conf` for Nginx
 - `npm-advanced-config.txt` for Nginx Proxy Manager
 - `caddyfile-netbird.txt` for Caddy
@@ -717,6 +791,7 @@ Runs for:
 
 - `builtin_traefik`
 - `external_traefik`
+- `nginx` when `nginx_install_config=true`
 - `npm` when `npm_configure_proxy_host=true`
 - `caddy` when `caddy_install_config=true`
 
@@ -777,8 +852,9 @@ config.yaml already exists
 
 Fix:
 
-- delete the old deployment directory for a fresh deployment, or
-- use `allow_existing_config=true` for an intentional in-place rerun
+- use `allow_existing_config=true` to converge the existing deployment, or
+- for a fresh start, run `docker compose down --volumes` in the project
+  directory and remove the generated files. That deletes all NetBird data.
 
 ### DNS not updated
 
@@ -821,6 +897,13 @@ Options:
 - use an existing certificate where supported
 - use a different test domain or subdomain
 
+For built-in Traefik testing:
+
+```yaml
+traefik_acme_ca_server: https://acme-staging-v02.api.letsencrypt.org/directory
+netbird_validate_certs: false
+```
+
 For Caddy testing:
 
 ```yaml
@@ -840,7 +923,7 @@ Fix the server certificate rather than trying to bypass the warning.
 ### Built-in Traefik
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=builtin_traefik \
   -e traefik_acme_email=admin@example.org
@@ -849,7 +932,7 @@ ansible-playbook -i inventory.ini getting_started.yml \
 ### External Traefik with Playbook-Installed Runtime
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=external_traefik \
   -e traefik_external_network=traefik \
@@ -860,7 +943,7 @@ ansible-playbook -i inventory.ini getting_started.yml \
 ### Host Nginx
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=nginx \
   -e nginx_install_config=true \
@@ -872,7 +955,7 @@ ansible-playbook -i inventory.ini getting_started.yml \
 ### Nginx Proxy Manager Fully Automated
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=npm \
   -e npm_install_config=true \
@@ -884,7 +967,7 @@ ansible-playbook -i inventory.ini getting_started.yml \
 ### Caddy Host Install
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=caddy \
   -e caddy_install_config=true \
@@ -894,7 +977,7 @@ ansible-playbook -i inventory.ini getting_started.yml \
 ### Manual Mode
 
 ```bash
-ansible-playbook -i inventory.ini getting_started.yml \
+ansible-playbook -i inventory.ini community.ansible_netbird.getting_started \
   -e netbird_domain=netbird.example.org \
   -e reverse_proxy_type=manual \
   -e bind_localhost_only=false
@@ -908,7 +991,7 @@ Then configure your reverse proxy to route:
 
 ## Security Notes
 
-- Treat generated secret files as sensitive.
+- Treat `config.yaml` and `proxy.env` as sensitive.
 - Do not commit real `npm_admin_secret` values.
 - Prefer inventory/group vars or Ansible Vault for credentials.
 - `npm_admin_secret` may bootstrap the initial NPM admin user on a fresh NPM
@@ -921,10 +1004,9 @@ Then configure your reverse proxy to route:
 
 These variables exist in the playbook but are not normal operator knobs:
 
-- container image variables
+- container image variables other than `traefik_image`
 - internal Traefik bridge IP/subnet/gateway
-- generated secret filenames
-- internal boolean derivations
-- constants listing supported proxy modes
+- `docker_socket_path`
+- health check retry counts
 
 Change those only when developing the playbook or debugging a specific issue.
