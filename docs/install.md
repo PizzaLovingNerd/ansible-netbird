@@ -1,36 +1,28 @@
 # NetBird Client Installation
 
-The `install.yml` playbook installs the NetBird client from the official NetBird package repositories. It can optionally install the desktop UI, manage the NetBird service, and enroll the client with a setup key.
+The `install.yml` playbook installs the NetBird client from the official NetBird package repositories. It is a thin wrapper around the `community.ansible_netbird.client` role, which follows [`install.sh`](https://github.com/netbirdio/netbird/blob/main/release_files/install.sh) from the NetBird repository. It can also install the desktop UI, manage the NetBird service, and enroll the client with a setup key.
 
-This playbook installs clients only. To deploy a self-hosted NetBird server, use `getting-started.yml` instead.
+This playbook installs clients only. To deploy a self-hosted NetBird server, use `getting_started.yml` instead.
 
 ## Supported Platforms
 
-The playbook detects and supports the following package managers:
+The role picks the package manager the same way `install.sh` does:
 
 - Debian and Ubuntu: `apt`
-- Fedora and other RPM-based distributions: `dnf`
-- RHEL-compatible distributions: `yum`
-- Image-based Fedora systems: `rpm-ostree`
-- macOS with Homebrew: `brew`
-- macOS without Homebrew: NetBird `.pkg`
+- Fedora, RHEL and compatible distributions: `dnf`, or `yum` where `dnf` is missing
+- Fedora Atomic desktops and other rpm-ostree systems: `rpm-ostree`
+- macOS: the NetBird `.pkg` installer
+- macOS with Homebrew: `brew`, only when selected with `force_package_manager=brew`
 
-Binary-only installation is not supported. The NetBird UI packages are supported only on `amd64` and `arm64`.
+Binary-only installation (`install.sh` on Synology and hosts without a supported package manager) is not supported. On NixOS and on bootc systems without rpm-ostree the role stops and explains what to do instead, like `install.sh`. The UI packages exist only for `amd64` and `arm64`.
 
 ## Requirements
 
-The Ansible control host needs Ansible installed and must be able to connect to each target host. Target hosts must provide:
-
-- Python for Ansible
-- Privilege escalation through `sudo`, `doas`, or another configured Ansible become method
-- Internet access to the NetBird package repositories
-- A supported package manager
-
-The SSH user does not need to be root, but package and service tasks require become privileges. Use `--ask-become-pass` if the remote user requires a sudo password.
+Target hosts need Python for Ansible, privilege escalation through `sudo`, `doas` or another become method, and HTTPS access to `pkgs.netbird.io`. The SSH user does not need to be root. Use `--ask-become-pass` if `sudo` asks for a password.
 
 ## Inventory
 
-Create an inventory with a `netbird` group:
+The playbook runs against the `netbird` group by default. Set `target_hosts` to use another group.
 
 ```ini
 [netbird]
@@ -38,17 +30,17 @@ workstation.example.com ansible_user=deploy
 192.0.2.20 ansible_user=deploy
 ```
 
-The repository's `inventory.ini` can also be updated with the intended hosts.
-
 ## Basic Installation
 
 Install the command-line client and start its service:
 
 ```bash
-ansible-playbook -i inventory.ini install.yml --ask-become-pass
+ansible-playbook -i inventory.ini community.ansible_netbird.install --ask-become-pass
 ```
 
-The default installation does not enroll the client. After installation, sign in interactively on the target host:
+From a checkout of this repository, use `playbooks/install.yml` instead of the collection name.
+
+Without a setup key the client is installed but not connected. Sign in on the target host with:
 
 ```bash
 netbird up
@@ -56,118 +48,91 @@ netbird up
 
 ## Unattended Enrollment
 
-Pass a NetBird setup key to enroll hosts during installation:
+Pass a setup key to enroll hosts during installation. A reusable key lets you roll NetBird out to many hosts in one run.
 
 ```bash
-ansible-playbook -i inventory.ini install.yml \
-  --ask-become-pass \
-  -e netbird_setup_key="$NETBIRD_SETUP_KEY"
-```
-
-For a self-hosted management server, also provide its URL:
-
-```bash
-ansible-playbook -i inventory.ini install.yml \
-  --ask-become-pass \
+ansible-playbook -i inventory.ini community.ansible_netbird.install \
   -e netbird_setup_key="$NETBIRD_SETUP_KEY" \
-  -e netbird_setup_management_url="https://netbird.example.org"
+  -e netbird_setup_management_url=https://netbird.example.org
 ```
 
-When pairing with a reusable setup key, this allows automated mass deployment of NetBird clients.
+Leave out `netbird_setup_management_url` to use NetBird Cloud.
 
-Avoid placing setup keys directly in inventory files or source control. Ansible Vault or an environment-backed secret workflow is preferable. Tasks that handle the setup key suppress their output with `no_log`.
+The key reaches `netbird up` through the `NB_SETUP_KEY` environment variable rather than the command line, so other users on the host cannot see it in the process list, and the tasks that handle it use `no_log`. Keep the key out of inventory files and source control; Ansible Vault works well.
 
-Enrollment requires `start_netbird_service=true`. By default, the playbook skips enrollment when `netbird status` already reports both Management and Signal as connected. Set `force_netbird_setup_key=true` to enroll again intentionally.
+After `netbird up` the role waits for `netbird status` to report Management as connected and fails if it never does, because `netbird up` can exit successfully without logging in (for example when the management server's TLS certificate is not trusted).
+
+Enrollment is skipped when `netbird status` already reports Management and Signal as connected, so re-running the playbook is safe. Set `force_netbird_setup_key=true` to enroll again, for example to move a host to another management server.
 
 ## Common Options
 
 ### Install the desktop UI
 
-The UI is disabled by default, which is appropriate for servers and other headless systems:
-
 ```bash
-ansible-playbook -i inventory.ini install.yml \
-  -e install_netbird_ui=true
+ansible-playbook -i inventory.ini community.ansible_netbird.install -e install_netbird_ui=true
 ```
 
-On Linux, the playbook warns if a desktop environment is not detected.
+`install.sh` skips the UI when `XDG_CURRENT_DESKTOP` is unset. Over SSH it is almost always unset, so the role installs the UI when asked and only warns.
 
-### Converge an existing installation
+### Upgrade NetBird
 
-The playbook refuses to modify a host where the `netbird` command appears to be installed unless explicitly allowed:
+Packages are installed with `state: present` by default, so a re-run leaves the installed version alone. Set `netbird_package_state=latest` to upgrade on every run. This is not supported on rpm-ostree hosts, where NetBird is updated with the rest of the deployment by `rpm-ostree upgrade`.
 
-```bash
-ansible-playbook -i inventory.ini install.yml \
-  -e allow_existing_netbird=true
-```
+### Existing installations
 
-This lets the selected package manager converge the existing installation. It does not uninstall NetBird or erase its configuration.
+Re-running the playbook on a host it already manages converges it; the package manager is recorded in `/etc/netbird/install.conf` like `install.sh` does. If NetBird is already on the host but was installed some other way (the binary install of `install.sh`, another package manager, or by hand), the role stops rather than install a second copy. Remove the old install first, or set `allow_existing_netbird=true` to let the selected package manager take over.
 
-For a Homebrew reinstall, also set `allow_homebrew_reinstall=true`. This permits the playbook to stop and uninstall the existing NetBird service and unlink the package before running `brew install`.
+For Homebrew, `allow_homebrew_reinstall=true` stops and uninstalls the existing NetBird service and unlinks the package before reinstalling it, which is what `install.sh` always does.
+
+### rpm-ostree hosts
+
+Packages layered with rpm-ostree only become available after a reboot. By default the role layers NetBird, says that a reboot is pending, and skips the service and enrollment steps; run the playbook again after rebooting. Set `rpm_ostree_reboot=true` to let the role reboot the host and carry on in the same run.
 
 ### Control the service
 
-The service is started and enabled at boot by default:
-
-```yaml
-start_netbird_service: true
-enable_netbird_service: true
-```
-
-Override these values when only the package should be installed:
+The service is started and enabled at boot by default. To install the package only:
 
 ```bash
-ansible-playbook -i inventory.ini install.yml \
-  -e start_netbird_service=false \
-  -e enable_netbird_service=false
+ansible-playbook -i inventory.ini community.ansible_netbird.install \
+  -e start_netbird_service=false -e enable_netbird_service=false
 ```
 
-The macOS `.pkg` path manages its own service and is excluded from the explicit service installation tasks.
+The macOS `.pkg` manages its own service.
 
 ### Force a package manager
 
-Package-manager detection can be overridden with one of `apt`, `dnf`, `yum`, `rpm-ostree`, `brew`, or `pkg`:
+Override detection with `apt`, `dnf`, `yum`, `rpm-ostree`, `brew` or `pkg`:
 
 ```bash
-ansible-playbook -i inventory.ini install.yml \
-  -e force_package_manager=dnf
+ansible-playbook -i inventory.ini community.ansible_netbird.install -e force_package_manager=dnf
 ```
-
-Only use this when the selected package manager is present and appropriate for the target.
 
 ## Variable Reference
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `install_netbird_ui` | `false` | Install the NetBird desktop UI in addition to the CLI. |
-| `start_netbird_service` | `true` | Install and start the NetBird service. Required for setup-key enrollment. |
-| `enable_netbird_service` | `true` | Enable the service at boot on Linux. |
-| `netbird_setup_key` | `""` | Optional setup key for unattended enrollment. |
-| `netbird_setup_management_url` | `""` | Optional management URL passed during setup-key enrollment. |
-| `force_netbird_setup_key` | `false` | Enroll even when NetBird already reports a connected state. |
-| `allow_existing_netbird` | `false` | Allow package convergence when NetBird is already installed. |
-| `allow_homebrew_reinstall` | `false` | Permit the Homebrew-specific stop, uninstall, and unlink sequence. |
-| `force_package_manager` | `""` | Override automatic package-manager detection. |
+| `install_netbird_ui` | `false` | Install the NetBird desktop UI as well as the CLI. |
+| `netbird_package_state` | `present` | `present` keeps the installed version, `latest` upgrades. |
+| `start_netbird_service` | `true` | Start the service. Required for setup key enrollment. |
+| `enable_netbird_service` | `true` | Start the service at boot. |
+| `netbird_setup_key` | `""` | Setup key for unattended enrollment. |
+| `netbird_setup_management_url` | `""` | Management URL for a self-hosted server. |
+| `force_netbird_setup_key` | `false` | Enroll even when the client is already connected. |
+| `allow_existing_netbird` | `false` | Take over an install made some other way. |
+| `allow_homebrew_reinstall` | `false` | Allow the Homebrew stop, uninstall and unlink sequence. |
+| `rpm_ostree_reboot` | `false` | Reboot rpm-ostree hosts so NetBird can start in the same run. |
+| `force_package_manager` | `""` | Override package manager detection. |
 
-Repository URLs, package names, config paths, and the macOS package destination are also variables in `install.yml`. They are implementation defaults and normally should not be overridden.
+Repository URLs, the keyring path and the macOS package URL are also role variables (see `roles/client/defaults/main.yml`). They rarely need changing.
 
 ## Verifying the Installation
-
-Run the following commands on a target host:
 
 ```bash
 netbird version
 netbird status
+systemctl status netbird   # Linux
 ```
-
-If no setup key was supplied, connect the client with `netbird up`. On Linux, the service can also be inspected with:
-
-```bash
-systemctl status netbird
-```
-
-For `rpm-ostree`, a reboot may be required before a newly layered package is available in the booted deployment.
 
 ## Check Mode
 
-Do not rely on `--check` as a complete dry run. Package-manager detection and status inspection run in check mode, but command-based installation and service operations cannot all be predicted safely without changing the target.
+`--check` runs detection and status checks, but it cannot predict the package and service steps that depend on the repository being configured first. Do not treat it as a complete dry run.
